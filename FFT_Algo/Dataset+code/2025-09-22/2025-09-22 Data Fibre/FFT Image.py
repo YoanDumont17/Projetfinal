@@ -7,7 +7,7 @@ from PIL import Image
 import glob
 
 
-dossier = r"FFT_Algo\2025-09-15 Data Edge"
+dossier = r"FFT_Algo\2025-09-22 Data Fibre"
 
 chemin_images = glob.glob(os.path.join(dossier, "*.png"))
 

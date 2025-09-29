@@ -1,0 +1,260 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from numpy.fft import fft2, fftshift
+from scipy import ndimage
+import glob
+import os
+import re
+from PIL import Image
+
+
+def entier_final(nom):
+    """Extrait le dernier nombre du nom de fichier"""
+    m = re.search(r'(-?\d+)(?!.*\d)', os.path.splitext(nom)[0])
+    return int(m.group(1)) if m else np.inf
+
+class AnalyseurNettete:
+    
+    def __init__(self):
+        self.resultats = {}
+    
+    def metrique_haute_frequence(self, image):
+        fft = fft2(image)               # Ici on stock le résultat de la FFT de l'image
+        fft_shift = fftshift(fft)       # On centre les basses fréquences
+        magnitude = np.abs(fft_shift)   # On prend la magnitude (partie réelle)
+        
+        rows, cols = image.shape        # On récupère les dimensions de l'image
+        centre_y, centre_x = rows//2, cols//2  # Centre des axes Y et X
+        
+        # On se crée un anneau pour les hautes fréquences (anneau externe). On va prendre en compte les fréquences au-delà d'un certain rayon
+        Y, X = np.ogrid[:rows, :cols]               # On crée une grille de coordonnées (cela correspond aux indices de chaque pixel)
+        distances = np.sqrt((X-centre_x)**2 + (Y-centre_y)**2)  
+        
+
+        rayon_min = min(centre_x, centre_y) * 0.3       # Définir le seuil pour hautes fréquences (ex: 30% du rayon max)
+        masque_hautes_freq = distances > rayon_min      # Tout ce qui est au-delà de ce rayon est considéré comme haute fréquence
+        
+        # Calculer l'énergie des hautes fréquences
+        energie_HF = np.sum(magnitude[masque_hautes_freq]**2)   # \sum amplitude^2
+        
+        return energie_HF
+    
+    def metrique_laplacien(self, image):
+
+        #Ici on utilise la variance du laplacien comme métrique de netteté. 
+        # En fait, on calcule le laplacien de l'image (dérivée seconde) et on regarde la variance de cette image résultante. 
+        # Plus la variance est élevée, plus l'image est considérée comme nette.
+        # Plus la dérivée seconde varie, plus il y a de détails fins dans l'image.
+
+        laplacien = ndimage.laplace(image)     # ndimage.laplace de scipy calcule le laplacien de l'image de la manière suivante : scipy.ndimage.laplace approximates these second derivatives using a convolution kernel .
+        kernel_array = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]])
+        return np.var(laplacien)
+
+    def metrique_laplacien8(self, image):
+        laplacien = ndimage.convolve(image, np.array([[1, 1, 1], [1, -8, 1], [1, 1, 1]]))
+        return np.var(laplacien) 
+    
+    def metrique_gradient(self, image):
+        """Cette métrique utilise le filtre de Sobel pour approximer le gradient de l'intensité de l'image selon les axes x et y.
+        Ensuite, on calcule la magnitude du gradient combiné et on somme toutes les magnitudes.
+        Plus cette somme est élevée, plus l'image est considérée comme nette car cela indique des variations d'intensité plus importantes (bords plus marqués)."""
+
+        grad_x = ndimage.sobel(image, axis=0)  # Calcul du gradient selon x, produit une image où chaque pixel représente le gradient dans cette direction
+        grad_y = ndimage.sobel(image, axis=1)  # Calcul du gradient selon y, produit une image où chaque pixel représente le gradient dans cette direction
+        gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2) # Magnitude du gradient combiné
+        return np.sum(gradient_magnitude)       # Somme de toutes les magnitudes du gradient, plus cette somme est élevée, plus l'image est considérée comme nette.
+    
+    def analyser_dossier(self, chemin_dossier):
+        """Analyser toutes les images PNG d'un dossier"""
+        chemins_images = glob.glob(os.path.join(chemin_dossier, "*.png"))
+        
+        resultats_complets = {
+            'noms': [],
+            'z_values': [],  
+            'haute_freq': [],
+            'laplacien': [],
+            'laplacien8': [],
+            'gradient': []
+        }
+        
+        for chemin in chemins_images:
+            nom = os.path.basename(chemin)
+            z_val = entier_final(nom)
+            print(f"Analyse de {nom} (z={z_val})...")
+            
+            # Charger l'image
+            img = Image.open(chemin)
+            if img.mode == 'RGB':
+                img = img.convert('L')
+            img_array = np.array(img, dtype=np.float64)
+            
+            # Normaliser l'image
+            img_array = (img_array - np.mean(img_array)) / np.std(img_array)
+            
+            # Calculer toutes les métriques
+            resultats_complets['noms'].append(nom)
+            resultats_complets['z_values'].append(z_val)  # AJOUT de la valeur z
+            resultats_complets['haute_freq'].append(self.metrique_haute_frequence(img_array))
+            resultats_complets['laplacien'].append(self.metrique_laplacien(img_array))
+            resultats_complets['laplacien8'].append(self.metrique_laplacien8(img_array))
+            resultats_complets['gradient'].append(self.metrique_gradient(img_array))
+        
+        self.resultats = resultats_complets
+        return resultats_complets
+    
+    def trouver_z_optimal_simple(self, resultats):
+        """Trouve le z optimal de manière simple"""
+        
+        z_values = np.array(resultats['z_values'])
+        
+        # Dictionnaire pour stocker le z optimal de chaque métrique
+        z_optimaux = {}
+        
+        # Normaliser et trouver le maximum pour chaque métrique
+        for metrique in ['haute_freq', 'laplacien', 'laplacien8', 'gradient']:
+            valeurs = np.array(resultats[metrique])
+            # Trouver l'index du maximum
+            idx_max = np.argmax(valeurs)
+            z_optimaux[metrique] = z_values[idx_max]
+        
+        # Moyenne pondérée (on privilégie le Laplacien8)
+        z_optimal = (0.35*z_optimaux['laplacien8']  +
+                    0.25*z_optimaux['haute_freq'] + 
+                    0.2*z_optimaux['laplacien'] + 
+                    0.2*z_optimaux['gradient'])
+        
+        # Incertitude = écart entre min et max divisé par 2
+        z_min = min(z_optimaux.values())
+        z_max = max(z_optimaux.values())
+        incertitude = (z_max - z_min) / 2
+        
+        return z_optimal, incertitude, z_optimaux
+    
+    def afficher_resultats_simple(self, resultats):      
+        z_values = np.array(resultats['z_values'])
+        z_optimal, incertitude, z_optimaux = self.trouver_z_optimal_simple(resultats)
+        
+        # Configuration du style
+        plt.style.use('seaborn-v0_8-darkgrid')
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig.patch.set_facecolor('white')
+       
+        couleurs = {
+            'haute_freq': '#3498db',  
+            'laplacien': '#e74c3c',   
+            'laplacien8': '#2ecc71',  
+            'gradient': '#f39c12'     
+        }
+        
+        configs = [
+            ('haute_freq', 'Haute Fréquence (FFT)', axes[0,0]),
+            ('laplacien', 'Laplacien C4', axes[0,1]),
+            ('laplacien8', 'Laplacien C8 ', axes[1,0]),
+            ('gradient', 'Gradient (Sobel)', axes[1,1])
+        ]
+        
+        for metrique, titre, ax in configs:
+            valeurs = np.array(resultats[metrique])
+            valeurs_norm = (valeurs - valeurs.min()) / (valeurs.max() - valeurs.min())
+            
+            ax.plot(z_values, valeurs_norm, 'o-', 
+                   color=couleurs[metrique], 
+                   markersize=6, 
+                   linewidth=2,
+                   alpha=0.7)
+            
+            # Marquer le maximum
+            idx_max = np.argmax(valeurs_norm)
+            ax.plot(z_values[idx_max], valeurs_norm[idx_max], 
+                   'o', color=couleurs[metrique], 
+                   markersize=12, 
+                   markeredgecolor='white',
+                   markeredgewidth=2)
+            
+            # Ligne verticale au z optimal de cette métrique
+            ax.axvline(x=z_optimaux[metrique], 
+                      color=couleurs[metrique], 
+                      linestyle='--', 
+                      alpha=0.5,
+                      linewidth=1.5)
+            
+            # Annotations
+            ax.text(z_optimaux[metrique], 0.05, 
+                   f'z = {z_optimaux[metrique]:.0f}',
+                   ha='center',
+                   fontsize=10,
+                   color=couleurs[metrique],
+                   fontweight='bold',
+                   transform=ax.get_xaxis_transform())
+            
+            ax.set_xlabel('Position z', fontsize=11)
+            ax.set_ylabel('Score normalisé', fontsize=11)
+            ax.set_title(titre, fontsize=12, fontweight='bold')
+            ax.set_ylim(-0.05, 1.1)
+            ax.grid(True, alpha=0.3)
+        
+        fig.suptitle(f'Position Focale Optimale: z = {z_optimal:.0f} ± {incertitude:.0f}', 
+                    fontsize=16, 
+                    fontweight='bold',
+                    y=1.02)   
+        plt.tight_layout()
+        plt.show()
+        
+  
+        print(f"\n Z OPTIMAL: {z_optimal:.0f} ± {incertitude:.0f}\n")
+        print("Détails par méthode:")
+   
+        for metrique, nom in [('laplacien8', 'Laplacien C8 (le plus fiable)'),
+                              ('laplacien', 'Laplacien C4'),
+                              ('gradient', 'Gradient'),
+                              ('haute_freq', 'Haute Fréquence')]:
+            print(f"  {nom:30s}: z = {z_optimaux[metrique]:.0f}")
+
+
+
+# Utilisation
+analyseur = AnalyseurNettete()
+
+dossier = r"FFT_Algo\Dataset+code\2025-09-29\2025-09-22 Data 1um Fibre"
+resultats = analyseur.analyser_dossier(dossier)
+
+# Afficher les résultats avec le z optimal
+analyseur.afficher_resultats_simple(resultats)  
+
+
+#analyseur = AnalyseurNettete()
+
+#dossier = r"FFT_Algo\2025-09-22 Data Fibre"
+#resultats = analyseur.analyser_dossier(dossier)
+
+
+
+#for i, nom in enumerate(resultats['noms']):
+ #   print(f"\n{nom}:")
+  #  print(f"  Haute Fréq.: {resultats['haute_freq'][i]:.2e}")
+   # print(f"  Laplacien: {resultats['laplacien'][i]:.4f}")
+    #print(f"  Gradient: {resultats['gradient'][i]:.2e}")
+
+
+#plt.plot(resultats['noms'], resultats['haute_freq'], marker='o', label='Haute Fréq.')
+#plt.xlabel('Images')
+#plt.ylabel('Somme des amplitudes au carré pour hautes fréquences')
+#plt.legend()
+#plt.show()
+#plt.plot(resultats['noms'], resultats['laplacien'], marker='s', label='Laplacien')
+#plt.xlabel('Images')
+#plt.ylabel('Variance du Laplacien')
+#plt.legend()
+#plt.show()
+#plt.plot(resultats['noms'], resultats['laplacien8'], marker='s', label='Laplacien 8')
+#plt.xlabel('Images')
+#plt.ylabel('Variance du Laplacien 8-connexité')
+#plt.legend()
+#plt.show()
+#plt.plot(resultats['noms'], resultats['gradient'], marker='^', label='Gradient')
+#plt.xlabel('Images')
+#plt.ylabel('Somme des magnitudes du gradient')
+#plt.legend()
+#plt.show()
+    
+

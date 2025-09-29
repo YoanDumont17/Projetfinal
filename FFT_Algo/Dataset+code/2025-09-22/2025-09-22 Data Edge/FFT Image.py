@@ -1,15 +1,13 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy as sp
-from numpy import fft as np_fft
-from scipy import fft as sp_fft
 from numpy.fft import fft2 as np_fft2
 import os
 from PIL import Image
 import glob
 
 
-dossier = r"FFT_Algo\2025-09-15 Data Fibre"
+dossier = r"FFT_Algo\2025-09-22 Data Edge"
 
 chemin_images = glob.glob(os.path.join(dossier, "*.png"))
 
@@ -27,12 +25,10 @@ for chemin in chemin_images:
     # Charger l'image
     img = Image.open(chemin)
     
-    # Convertir en niveaux de gris si l'image est en couleur
-    if img.mode == 'RGB':
-        img = img.convert('L')
     
     # Convertir en array numpy
     img_array = np.array(img)
+    print(img_array.shape)
     images.append(img_array)
     
     # Appliquer la FFT2
