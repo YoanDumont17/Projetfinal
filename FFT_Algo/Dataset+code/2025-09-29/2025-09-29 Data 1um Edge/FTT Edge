@@ -68,7 +68,7 @@ class AnalyseurNettete:
         """Analyser toutes les images PNG d'un dossier"""
         chemins_images = glob.glob(os.path.join(chemin_dossier, "*.png"))
         
-        # ⚠️ AJOUT CRUCIAL : Trier les chemins par valeur z !
+        
         chemins_images.sort(key=lambda p: entier_final(os.path.basename(p)))
         
         resultats_complets = {
