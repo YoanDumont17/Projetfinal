@@ -1,0 +1,173 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from numpy.fft import fft2, fftshift
+from scipy import ndimage
+import glob, os, re
+from PIL import Image
+
+def entier_final(nom):
+    m = re.search(r'(-?\d+)(?!.*\d)', os.path.splitext(nom)[0])
+    return int(m.group(1)) if m else np.inf
+
+class AnalyseurNettete:
+    def __init__(self):
+        self.resultats = {}
+
+    def metrique_haute_frequence(self, image):
+        F = fftshift(fft2(image))
+        mag = np.abs(F)
+        rows, cols = image.shape
+        cy, cx = rows//2, cols//2
+        Y, X = np.ogrid[:rows, :cols]
+        r = np.sqrt((X-cx)**2 + (Y-cy)**2)
+        r_min = min(cx, cy) * 0.3
+        mask_hf = r > r_min
+        return np.sum(mag[mask_hf]**2)
+
+    def metrique_laplacien(self, image):
+        lap = ndimage.laplace(image)
+        return np.var(lap)
+
+    def metrique_laplacien8(self, image):
+        k = np.array([[1,1,1],[1,-8,1],[1,1,1]])
+        lap8 = ndimage.convolve(image, k, mode='reflect')
+        return np.var(lap8)
+
+    def metrique_gradient(self, image):
+        gx = ndimage.sobel(image, axis=0)
+        gy = ndimage.sobel(image, axis=1)
+        return np.sum(np.sqrt(gx**2 + gy**2))
+
+    def analyser_dossier(self, chemin_dossier):
+        chemins = glob.glob(os.path.join(chemin_dossier, "*.png"))
+        # TRIER par l'entier final
+        chemins.sort(key=lambda p: entier_final(os.path.basename(p)))
+
+        res = {'noms': [], 'z_values': [],
+               'haute_freq': [], 'laplacien': [],
+               'laplacien8': [], 'gradient': []}
+
+        for chemin in chemins:
+            nom = os.path.basename(chemin)
+            z_val = entier_final(nom)
+            img = Image.open(chemin)
+            if img.mode == 'RGB':
+                img = img.convert('L')
+            arr = np.array(img, dtype=np.float64)
+            arr = (arr - np.mean(arr)) / (np.std(arr) + 1e-12)
+
+            res['noms'].append(nom)
+            res['z_values'].append(z_val)
+            res['haute_freq'].append(self.metrique_haute_frequence(arr))
+            res['laplacien'].append(self.metrique_laplacien(arr))
+            res['laplacien8'].append(self.metrique_laplacien8(arr))
+            res['gradient'].append(self.metrique_gradient(arr))
+
+        self.resultats = res
+        return res
+
+    def trouver_z_optimal_simple(self, resultats):
+            z = np.asarray(resultats['z_values'])
+            z_optimaux = {}
+            for m in ['haute_freq', 'laplacien', 'laplacien8', 'gradient']:
+                vals = np.asarray(resultats[m])
+                z_optimaux[m] = z[np.argmax(vals)]
+            z_opt = (0.35*z_optimaux['laplacien8']
+                    + 0.25*z_optimaux['haute_freq']
+                    + 0.20*z_optimaux['laplacien']
+                    + 0.20*z_optimaux['gradient'])
+            z_min, z_max = min(z_optimaux.values()), max(z_optimaux.values())
+            incert = (z_max - z_min) / 2
+            return z_opt, incert, z_optimaux
+
+    def afficher_resultats_simple(self, resultats, *,
+                                z_scale_um=1.0,   # facteur -> µm
+                                base_fs=12,       # taille de police de base
+                                savepath=None):   # "figure.png" ou "figure.pdf"
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        # Style fig
+        plt.rcParams.update({
+            'figure.dpi': 120,
+            'font.size': base_fs,
+            'axes.labelsize': base_fs,
+            'axes.titlesize': base_fs + 1,
+            'xtick.labelsize': base_fs - 1,
+            'ytick.labelsize': base_fs - 1,
+            'legend.fontsize': base_fs - 1,
+            'grid.alpha': 0.25
+        })
+
+        z_raw = np.asarray(resultats['z_values'], dtype=float)
+        order = np.argsort(z_raw)
+        z = z_raw[order] * float(z_scale_um)  # -> µm
+
+        metrics = [
+            ('haute_freq', 'Haute fréquence (FFT)'),
+            ('laplacien',  'Laplacien C4'),
+            ('laplacien8', 'Laplacien C8'),
+            ('gradient',   'Gradient (Sobel)')
+        ]
+
+        # z* global pour l’en-tête
+        z_opt, incert, z_optimaux = self.trouver_z_optimal_simple(resultats)
+
+        fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+        fig.patch.set_facecolor('white')
+
+        for i, (ax, (key, title)) in enumerate(zip(axes.ravel(), metrics)):
+            y = np.asarray(resultats[key], dtype=float)[order]
+            y_norm = (y - y.min()) / (y.max() - y.min() + 1e-12)
+
+            # Courbe noire
+            ax.plot(z, y_norm, 'o-', color='k', linewidth=2, markersize=4)
+
+            # Marqueur au max
+            i_max = int(np.argmax(y_norm))
+            ax.plot(z[i_max], y_norm[i_max], 'o', color='k', markersize=8)
+
+            # Ligne verticale au z* de cette métrique
+            z_star_metric_um = z_scale_um * z_optimaux[key]
+            ax.axvline(x=z_star_metric_um, color='0.6', linestyle='--', linewidth=1)
+
+            # Titre + axes
+            ax.set_title(title)
+            ax.set_ylabel('Score normalisé')
+            ax.set_ylim(-0.05, 1.05)
+
+
+            # Annotation interne : z* (µm) en haut à droite du panneau
+            ax.text(0.98, 0.90,
+                    f"z* = {z_star_metric_um:.0f} µm",
+                    ha='right', va='top',
+                    transform=ax.transAxes,
+                    fontsize=base_fs,
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='0.8'))
+
+            # Gestion des graduations x :
+            # - top row (i = 0,1) : pas de ticks/étiquettes x
+            # - bottom row (i = 2,3) : on garde l’axe x avec unités
+            if i < 2:
+                ax.set_xlabel('')
+                ax.set_xticks([])
+                ax.set_xticklabels([])
+            else:
+                ax.set_xlabel('Position z (µm)')
+
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if savepath:
+            fig.savefig(savepath, bbox_inches='tight')
+        plt.show()
+
+# --- Utilisation ---
+analyseur = AnalyseurNettete()
+dossier = r"FFT_Algo\Dataset+code\2025-09-22\2025-09-22 Data Edge"
+resultats = analyseur.analyser_dossier(dossier)
+
+# Exemple : pas en µm ? si 1 pas = 5 µm, mets z_scale_um=5
+analyseur.afficher_resultats_simple(resultats,
+                                    z_scale_um=1.0,
+                                    base_fs=13,
+                                    savepath=None)  # ex: "focus_plot.pdf"
