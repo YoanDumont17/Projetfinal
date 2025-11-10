@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+Script pour identifier l'interface réseau à utiliser pour EtherCAT
+
+Ce script t'aide à trouver quelle interface utiliser pour communiquer
+avec ton driver STF06-ETX.
+"""
+
+import subprocess
+import sys
+import re
+
+
+def get_network_interfaces():
+    """
+    Récupère toutes les interfaces réseau disponibles
+    """
+    print("\n" + "=" * 70)
+    print(" DÉTECTION DES INTERFACES RÉSEAU")
+    print("=" * 70 + "\n")
+    
+    interfaces = []
+    
+    try:
+        # Méthode 1: Utilise ip link show
+        print("🔍 Recherche des interfaces réseau...\n")
+        result = subprocess.run(['ip', 'link', 'show'], 
+                              capture_output=True, text=True, check=True)
+        
+        # Parse la sortie
+        for line in result.stdout.split('\n'):
+            # Cherche les lignes qui commencent par un numéro (ex: "2: eth0:")
+            match = re.match(r'^\d+:\s+(\S+):', line)
+            if match:
+                interface_name = match.group(1)
+                
+                # Ignore l'interface loopback (lo)
+                if interface_name == 'lo':
+                    continue
+                
+                # Vérifie si l'interface est UP
+                is_up = 'UP' in line
+                
+                # Récupère plus d'infos sur cette interface
+                try:
+                    # Obtient l'adresse MAC
+                    ip_result = subprocess.run(['ip', 'link', 'show', interface_name],
+                                              capture_output=True, text=True)
+                    mac_match = re.search(r'link/ether\s+([0-9a-f:]+)', ip_result.stdout)
+                    mac = mac_match.group(1) if mac_match else "N/A"
+                    
+                    # Obtient l'adresse IP si elle existe
+                    ip_addr_result = subprocess.run(['ip', 'addr', 'show', interface_name],
+                                                   capture_output=True, text=True)
+                    ip_match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', ip_addr_result.stdout)
+                    ip = ip_match.group(1) if ip_match else "Pas d'IP"
+                    
+                    interfaces.append({
+                        'name': interface_name,
+                        'is_up': is_up,
+                        'mac': mac,
+                        'ip': ip
+                    })
+                except:
+                    pass
+        
+        return interfaces
+        
+    except subprocess.CalledProcessError:
+        print("❌ Erreur: Impossible d'exécuter 'ip link show'")
+        return []
+
+
+def display_interfaces(interfaces):
+    """
+    Affiche les interfaces de manière lisible
+    """
+    if not interfaces:
+        print("❌ Aucune interface réseau trouvée!\n")
+        return
+    
+    print("📡 Interfaces réseau détectées:\n")
+    print("-" * 70)
+    
+    for i, iface in enumerate(interfaces, 1):
+        status = "🟢 UP" if iface['is_up'] else "🔴 DOWN"
+        
+        print(f"\n{i}. {iface['name']}")
+        print(f"   État:       {status}")
+        print(f"   Adresse MAC: {iface['mac']}")
+        print(f"   Adresse IP:  {iface['ip']}")
+    
+    print("\n" + "-" * 70)
+
+
+def recommend_interface(interfaces):
+    """
+    Recommande quelle interface utiliser
+    """
+    print("\n💡 RECOMMANDATIONS:\n")
+    
+    # Filtre les interfaces actives
+    active_interfaces = [iface for iface in interfaces if iface['is_up']]
+    
+    if not active_interfaces:
+        print("⚠️  Aucune interface n'est active (UP)!")
+        print("   Vérifie que ton câble Ethernet est branché.\n")
+        return None
+    
+    # Cherche les interfaces Ethernet typiques
+    eth_interfaces = [iface for iface in active_interfaces 
+                     if iface['name'].startswith(('eth', 'enp', 'eno'))]
+    
+    if len(eth_interfaces) == 1:
+        iface = eth_interfaces[0]
+        print(f"✅ Interface recommandée: {iface['name']}")
+        print(f"   (C'est la seule interface Ethernet active)")
+        print(f"\n   Utilise cette ligne dans ton code:")
+        print(f"   INTERFACE = '{iface['name']}'")
+        return iface['name']
+    
+    elif len(eth_interfaces) > 1:
+        print("⚠️  Plusieurs interfaces Ethernet détectées:")
+        for iface in eth_interfaces:
+            ip_info = f" (IP: {iface['ip']})" if iface['ip'] != "Pas d'IP" else ""
+            print(f"   - {iface['name']}{ip_info}")
+        
+        print("\n   📋 Comment choisir:")
+        print("   1. L'interface EtherCAT n'a généralement PAS d'adresse IP")
+        print("   2. Vérifie quel port Ethernet est branché à ton driver")
+        print("   3. Essaie chaque interface avec le script de test")
+        
+        # Recommande celle sans IP si elle existe
+        no_ip_interfaces = [iface for iface in eth_interfaces if iface['ip'] == "Pas d'IP"]
+        if no_ip_interfaces:
+            iface = no_ip_interfaces[0]
+            print(f"\n   💡 Essaie d'abord: {iface['name']}")
+            print(f"      (Cette interface n'a pas d'IP, typique pour EtherCAT)")
+            return iface['name']
+        
+        return eth_interfaces[0]['name']
+    
+    else:
+        print("⚠️  Aucune interface Ethernet standard détectée.")
+        print("   Interfaces actives:")
+        for iface in active_interfaces:
+            print(f"   - {iface['name']}")
+        
+        if active_interfaces:
+            return active_interfaces[0]['name']
+    
+    return None
+
+
+def test_interface_for_ethercat(interface_name):
+    """
+    Teste si une interface semble être configurée pour EtherCAT
+    """
+    print(f"\n🔬 Test de l'interface {interface_name}...\n")
+    
+    try:
+        # Vérifie si l'interface est UP
+        result = subprocess.run(['ip', 'link', 'show', interface_name],
+                              capture_output=True, text=True)
+        
+        if 'state UP' not in result.stdout:
+            print(f"⚠️  L'interface {interface_name} est DOWN")
+            print("   Vérifie que le câble est branché")
+            return False
+        
+        print(f"✅ Interface {interface_name} est UP")
+        
+        # Vérifie la vitesse du lien
+        try:
+            ethtool_result = subprocess.run(['ethtool', interface_name],
+                                           capture_output=True, text=True)
+            
+            if 'Speed:' in ethtool_result.stdout:
+                speed_match = re.search(r'Speed:\s+(\d+)', ethtool_result.stdout)
+                if speed_match:
+                    speed = speed_match.group(1)
+                    print(f"✅ Vitesse du lien: {speed} Mb/s")
+                    
+                    if speed == '100':
+                        print("   👍 100 Mb/s est parfait pour EtherCAT")
+                    elif speed == '1000':
+                        print("   👍 1000 Mb/s fonctionne aussi")
+            
+            if 'Link detected: yes' in ethtool_result.stdout:
+                print("✅ Lien physique détecté")
+            else:
+                print("⚠️  Pas de lien physique détecté")
+                print("   → Vérifie le câble réseau")
+                return False
+                
+        except FileNotFoundError:
+            print("⚠️  'ethtool' n'est pas installé (optionnel)")
+            print("   Installe avec: sudo apt-get install ethtool")
+        
+        # Vérifie l'adresse IP
+        ip_result = subprocess.run(['ip', 'addr', 'show', interface_name],
+                                   capture_output=True, text=True)
+        
+        has_ip = 'inet ' in ip_result.stdout
+        
+        if not has_ip:
+            print("✅ Pas d'adresse IP configurée")
+            print("   👍 C'est normal et recommandé pour EtherCAT")
+        else:
+            ip_match = re.search(r'inet\s+(\d+\.\d+\.\d+\.\d+)', ip_result.stdout)
+            if ip_match:
+                ip = ip_match.group(1)
+                print(f"⚠️  Adresse IP détectée: {ip}")
+                print("   EtherCAT peut fonctionner avec une IP, mais ce n'est pas idéal")
+        
+        print(f"\n✅ L'interface {interface_name} semble OK pour EtherCAT!")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Erreur lors du test: {e}")
+        return False
+
+
+def create_test_command(interface_name):
+    """
+    Crée la commande de test à exécuter
+    """
+    print("\n" + "=" * 70)
+    print(" PROCHAINES ÉTAPES")
+    print("=" * 70 + "\n")
+    
+    print(f"1. Teste la connexion EtherCAT avec cette interface:")
+    print(f"   sudo python3 test_connection.py {interface_name}")
+    
+    print(f"\n2. Si le test réussit, utilise cette ligne dans ton code:")
+    print(f"   INTERFACE = '{interface_name}'")
+    
+    print(f"\n3. Lance le script principal:")
+    print(f"   sudo python3 stf06_ethercat_control.py")
+    
+    print()
+
+
+def main():
+    """
+    Fonction principale
+    """
+    print("\n" + "🔌" * 35)
+    print(" IDENTIFICATION DE L'INTERFACE RÉSEAU ETHERCAT")
+    print("🔌" * 35)
+    
+    # Vérifie les permissions root (pas obligatoire pour ce script)
+    import os
+    if os.geteuid() != 0:
+        print("\n💡 Info: Ce script peut être exécuté sans root,")
+        print("   mais le test détaillé nécessite: sudo python3 find_interface.py\n")
+    
+    # Récupère les interfaces
+    interfaces = get_network_interfaces()
+    
+    if not interfaces:
+        print("\n❌ Impossible de détecter les interfaces réseau.")
+        print("   Essaie manuellement avec: ip link show\n")
+        return
+    
+    # Affiche les interfaces
+    display_interfaces(interfaces)
+    
+    # Recommande une interface
+    recommended = recommend_interface(interfaces)
+    
+    # Si on est en root, teste l'interface recommandée
+    import os
+    if recommended and os.geteuid() == 0:
+        test_interface_for_ethercat(recommended)
+        create_test_command(recommended)
+    elif recommended:
+        print(f"\n💡 Pour un test plus détaillé, exécute:")
+        print(f"   sudo python3 find_interface.py")
+        create_test_command(recommended)
+    
+    print("\n📝 NOTES IMPORTANTES:")
+    print("-" * 70)
+    print("• L'interface EtherCAT n'a généralement PAS d'adresse IP")
+    print("• Le câble doit être branché DIRECTEMENT au driver (pas via switch)")
+    print("• La LED d'activité réseau sur le driver doit être allumée")
+    print("• Si tu as plusieurs interfaces, teste chacune avec test_connection.py")
+    print("-" * 70 + "\n")
+
+
+if __name__ == "__main__":
+    main()

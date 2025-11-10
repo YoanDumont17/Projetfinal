@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+"""
+Contrôle du driver STF06-ETX via EtherCAT avec PySOEM
+Basé sur le manuel EtherCAT User Manual 920-0158 Rev:B
+
+Ce script implémente la séquence d'activation complète du driver
+et permet de faire tourner le moteur en mode Profile Velocity.
+"""
+
+import pysoem
+import struct
+import time
+import sys
+
+
+class STF06Driver:
+    """
+    Classe pour contrôler le driver STF06-ETX via EtherCAT
+    """
+    
+    # ============================================================================
+    # OBJETS DU DICTIONNAIRE CoE (Communication over EtherCAT)
+    # Référence: Section 4 du manuel, pages 45+
+    # ============================================================================
+    
+    # Objets de contrôle principaux
+    OBJ_CONTROLWORD = 0x6040      # Commandes vers le driver
+    OBJ_STATUSWORD = 0x6041       # État du driver
+    OBJ_MODE_OF_OPERATION = 0x6060        # Sélection du mode
+    OBJ_MODE_OF_OPERATION_DISPLAY = 0x6061  # Mode actuel
+    
+    # Objets pour Profile Velocity Mode (Mode 3)
+    OBJ_TARGET_VELOCITY = 0x60FF   # Vitesse cible
+    OBJ_PROFILE_ACCELERATION = 0x6083  # Accélération
+    OBJ_PROFILE_DECELERATION = 0x6084  # Décélération
+    
+    # ============================================================================
+    # VALEURS DU CONTROLWORD (0x6040)
+    # Référence: Section 3.1, page 13-14 du manuel
+    # Ces valeurs permettent de passer d'un état à l'autre dans la machine FSA
+    # ============================================================================
+    
+    CMD_SHUTDOWN = 0x0006          # 0b0000_0110 - Prépare le driver
+    CMD_SWITCH_ON = 0x0007         # 0b0000_0111 - Active l'électronique
+    CMD_ENABLE_OPERATION = 0x000F  # 0b0000_1111 - Autorise le mouvement
+    CMD_DISABLE_VOLTAGE = 0x0000   # 0b0000_0000 - Coupe l'alimentation
+    CMD_QUICK_STOP = 0x0002        # 0b0000_0010 - Arrêt d'urgence
+    CMD_FAULT_RESET = 0x0080       # 0b1000_0000 - Réinitialise les erreurs
+    
+    # ============================================================================
+    # MASQUES DU STATUSWORD (0x6041)
+    # Référence: Section 3.1, page 13 du manuel
+    # Permettent de vérifier l'état actuel du driver
+    # ============================================================================
+    
+    # États de la machine FSA (bits 0-6)
+    STATUS_NOT_READY_TO_SWITCH_ON = 0x0000  # xxxx_xxxx_x0xx_0000
+    STATUS_SWITCH_ON_DISABLED = 0x0040      # xxxx_xxxx_x1xx_0000
+    STATUS_READY_TO_SWITCH_ON = 0x0021      # xxxx_xxxx_x01x_0001
+    STATUS_SWITCHED_ON = 0x0023             # xxxx_xxxx_x01x_0011
+    STATUS_OPERATION_ENABLED = 0x0027       # xxxx_xxxx_x01x_0111
+    STATUS_FAULT = 0x0008                   # xxxx_xxxx_x0xx_1000
+    
+    # Masque pour extraire les bits d'état pertinents
+    STATUS_MASK = 0x006F  # 0b0000_0000_0110_1111
+    
+    # ============================================================================
+    # MODES DE FONCTIONNEMENT (0x6060)
+    # Référence: Section 3.2, page 15 du manuel
+    # ============================================================================
+    
+    MODE_PROFILE_POSITION = 1   # Mode position (point à point)
+    MODE_PROFILE_VELOCITY = 3   # Mode vitesse (le plus simple)
+    MODE_PROFILE_TORQUE = 4     # Mode couple (StepSERVO uniquement)
+    MODE_HOMING = 6             # Mode recherche d'origine
+    MODE_CYCLIC_SYNC_POSITION = 8   # Mode position synchrone
+    MODE_CYCLIC_SYNC_VELOCITY = 9   # Mode vitesse synchrone
+    
+    def __init__(self, ifname='eth0', slave_position=0):
+        """
+        Initialise la connexion EtherCAT avec le driver
+        
+        Args:
+            ifname: Nom de l'interface réseau (ex: 'eth0', 'enp3s0')
+            slave_position: Position du slave sur le réseau (0 = premier device)
+        """
+        self.ifname = ifname
+        self.slave_position = slave_position
+        self.master = None
+        self.slave = None
+        
+    def connect(self):
+        """
+        Établit la connexion EtherCAT avec le driver
+        
+        ÉTAPES:
+        1. Initialise le master EtherCAT
+        2. Configure le réseau
+        3. Passe à l'état SAFE_OPERATIONAL puis OPERATIONAL
+        
+        Référence: Section 2.7, page 12 du manuel (EtherCAT State Machine)
+        """
+        print("=" * 70)
+        print("ÉTAPE 1: INITIALISATION DE LA COMMUNICATION EtherCAT")
+        print("=" * 70)
+        
+        try:
+            # Crée le master EtherCAT
+            self.master = pysoem.Master()
+            
+            # Ouvre l'interface réseau
+            print(f"→ Ouverture de l'interface: {self.ifname}")
+            if self.master.open(self.ifname):
+                print("✓ Interface ouverte avec succès")
+            else:
+                raise Exception(f"Impossible d'ouvrir l'interface {self.ifname}")
+            
+            # Recherche et configure tous les slaves
+            print("→ Recherche des devices EtherCAT...")
+            slave_count = self.master.config_init()
+            
+            if slave_count == 0:
+                raise Exception("Aucun device EtherCAT trouvé!")
+            
+            print(f"✓ {slave_count} device(s) trouvé(s)")
+            
+            # Sélectionne le slave à la position spécifiée
+            if self.slave_position >= slave_count:
+                raise Exception(f"Position {self.slave_position} invalide (seulement {slave_count} devices)")
+            
+            self.slave = self.master.slaves[self.slave_position]
+            print(f"✓ Device sélectionné: {self.slave.name}")
+            
+            # Configure les PDO mappings (Process Data Objects)
+            # Les PDO sont les données échangées cycliquement
+            print("→ Configuration des PDO mappings...")
+            self.master.config_map()
+            print("✓ PDO mappings configurés")
+            
+            # Passe à l'état SAFE_OPERATIONAL
+            # Dans cet état, les inputs sont actifs mais pas les outputs
+            print("→ Transition vers SAFE_OPERATIONAL...")
+            self.master.state_check(pysoem.SAFEOP_STATE, 50000)
+            
+            if self.master.state != pysoem.SAFEOP_STATE:
+                raise Exception(f"Impossible d'atteindre SAFE_OP (état actuel: {self.master.state})")
+            
+            print("✓ État SAFE_OPERATIONAL atteint")
+            
+            # Passe à l'état OPERATIONAL
+            # Dans cet état, tout est actif (inputs ET outputs)
+            print("→ Transition vers OPERATIONAL...")
+            self.master.state = pysoem.OP_STATE
+            self.master.write_state()
+            
+            # Attend que tous les slaves atteignent l'état OPERATIONAL
+            self.master.state_check(pysoem.OP_STATE, 50000)
+            
+            if self.master.state != pysoem.OP_STATE:
+                raise Exception(f"Impossible d'atteindre OPERATIONAL (état actuel: {self.master.state})")
+            
+            print("✓ État OPERATIONAL atteint")
+            print("✓ Communication EtherCAT établie avec succès!\n")
+            
+            return True
+            
+        except Exception as e:
+            print(f"✗ ERREUR lors de la connexion: {e}")
+            if self.master:
+                self.master.close()
+            return False
+    
+    def read_sdo(self, index, subindex, size):
+        """
+        Lit un objet SDO (Service Data Object) depuis le driver
+        
+        Les SDO sont utilisés pour lire/écrire des paramètres de configuration
+        (par opposition aux PDO qui sont les données cycliques temps-réel)
+        
+        Args:
+            index: Index de l'objet (ex: 0x6041 pour statusword)
+            subindex: Sous-index (généralement 0)
+            size: Taille en octets (1, 2, 4, etc.)
+        
+        Returns:
+            La valeur lue, ou None si erreur
+        """
+        try:
+            # La méthode sdo_read retourne un bytearray
+            data = self.slave.sdo_read(index, subindex, size)
+            
+            # Convertit le bytearray en entier selon la taille
+            if size == 1:
+                return struct.unpack('B', data)[0]  # Unsigned byte
+            elif size == 2:
+                return struct.unpack('H', data)[0]  # Unsigned short
+            elif size == 4:
+                return struct.unpack('I', data)[0]  # Unsigned int
+            else:
+                return int.from_bytes(data, byteorder='little')
+                
+        except Exception as e:
+            print(f"✗ Erreur lecture SDO 0x{index:04X}:{subindex}: {e}")
+            return None
+    
+    def write_sdo(self, index, subindex, value, size):
+        """
+        Écrit un objet SDO vers le driver
+        
+        Args:
+            index: Index de l'objet
+            subindex: Sous-index
+            value: Valeur à écrire
+            size: Taille en octets
+        
+        Returns:
+            True si succès, False si erreur
+        """
+        try:
+            # Convertit la valeur en bytes selon la taille
+            if size == 1:
+                data = struct.pack('B', value)  # Unsigned byte
+            elif size == 2:
+                data = struct.pack('H', value)  # Unsigned short
+            elif size == 4:
+                data = struct.pack('I', value)  # Unsigned int
+            else:
+                data = value.to_bytes(size, byteorder='little')
+            
+            # Écrit via SDO
+            self.slave.sdo_write(index, subindex, data)
+            return True
+            
+        except Exception as e:
+            print(f"✗ Erreur écriture SDO 0x{index:04X}:{subindex} = {value}: {e}")
+            return False
+    
+    def read_statusword(self):
+        """
+        Lit le statusword (0x6041) qui indique l'état du driver
+        
+        Le statusword est crucial pour comprendre dans quel état
+        se trouve la machine d'état FSA du driver.
+        
+        Returns:
+            La valeur du statusword (16 bits)
+        """
+        return self.read_sdo(self.OBJ_STATUSWORD, 0, 2)
+    
+    def write_controlword(self, value):
+        """
+        Écrit le controlword (0x6040) pour envoyer des commandes au driver
+        
+        Le controlword permet de contrôler les transitions de la machine FSA.
+        
+        Args:
+            value: Valeur du controlword (voir CMD_* constants)
+        """
+        return self.write_sdo(self.OBJ_CONTROLWORD, 0, value, 2)
+    
+    def get_state_name(self, statusword):
+        """
+        Détermine le nom de l'état actuel depuis le statusword
+        
+        Référence: Tableau page 13 du manuel
+        
+        Args:
+            statusword: Valeur du statusword
+        
+        Returns:
+            Nom de l'état sous forme de string
+        """
+        # Applique le masque pour ne garder que les bits pertinents
+        state_bits = statusword & self.STATUS_MASK
+        
+        # Compare avec les patterns connus
+        if (statusword & 0x004F) == 0x0000:
+            return "NOT_READY_TO_SWITCH_ON"
+        elif (statusword & 0x004F) == 0x0040:
+            return "SWITCH_ON_DISABLED"
+        elif (statusword & 0x006F) == 0x0021:
+            return "READY_TO_SWITCH_ON"
+        elif (statusword & 0x006F) == 0x0023:
+            return "SWITCHED_ON"
+        elif (statusword & 0x006F) == 0x0027:
+            return "OPERATION_ENABLED"
+        elif (statusword & 0x006F) == 0x0007:
+            return "QUICK_STOP_ACTIVE"
+        elif (statusword & 0x004F) == 0x000F:
+            return "FAULT_REACTION_ACTIVE"
+        elif (statusword & 0x004F) == 0x0008:
+            return "FAULT"
+        else:
+            return f"UNKNOWN (0x{statusword:04X})"
+    
+    def wait_for_state(self, target_statusword_pattern, mask, timeout=5.0):
+        """
+        Attend que le driver atteigne un état spécifique
+        
+        Args:
+            target_statusword_pattern: Pattern attendu du statusword
+            mask: Masque pour comparer seulement certains bits
+            timeout: Temps max d'attente en secondes
+        
+        Returns:
+            True si l'état est atteint, False si timeout
+        """
+        start_time = time.time()
+        
+        while (time.time() - start_time) < timeout:
+            statusword = self.read_statusword()
+            if statusword is None:
+                time.sleep(0.01)
+                continue
+            
+            if (statusword & mask) == target_statusword_pattern:
+                return True
+            
+            time.sleep(0.01)  # Petite pause pour ne pas saturer le réseau
+        
+        return False
+    
+    def enable_drive(self):
+        """
+        Active le driver en suivant la séquence FSA complète
+        
+        SÉQUENCE D'ACTIVATION (Référence: Section 3.1, pages 13-14):
+        
+        État initial: SWITCH_ON_DISABLED (driver bloqué par sécurité)
+            ↓
+        1. SHUTDOWN (0x0006): Prépare le driver
+            → État: READY_TO_SWITCH_ON
+            ↓
+        2. SWITCH ON (0x0007): Active l'électronique de puissance
+            → État: SWITCHED_ON
+            ↓
+        3. ENABLE OPERATION (0x000F): Autorise le mouvement
+            → État: OPERATION_ENABLED ✓ (le moteur peut maintenant bouger!)
+        
+        Cette séquence est OBLIGATOIRE selon le standard CiA 402.
+        Sans cette activation, toutes les commandes de mouvement seront ignorées.
+        
+        Returns:
+            True si activation réussie, False sinon
+        """
+        print("=" * 70)
+        print("ÉTAPE 2: ACTIVATION DU DRIVER (Séquence FSA)")
+        print("=" * 70)
+        
+        try:
+            # Vérifie l'état initial
+            statusword = self.read_statusword()
+            if statusword is None:
+                raise Exception("Impossible de lire le statusword")
+            
+            initial_state = self.get_state_name(statusword)
+            print(f"État initial: {initial_state} (0x{statusword:04X})")
+            
+            # Si en FAULT, on doit d'abord réinitialiser
+            if (statusword & 0x004F) == 0x0008:
+                print("\n⚠ Driver en FAULT! Réinitialisation...")
+                print("→ Envoi de FAULT_RESET (0x0080)...")
+                self.write_controlword(self.CMD_FAULT_RESET)
+                time.sleep(0.1)
+                
+                # Après reset, on redescend à 0
+                self.write_controlword(0x0000)
+                time.sleep(0.5)
+                
+                statusword = self.read_statusword()
+                print(f"✓ État après reset: {self.get_state_name(statusword)}")
+            
+            # ----------------------------------------------------------------
+            # TRANSITION 1: SHUTDOWN (vers READY_TO_SWITCH_ON)
+            # ----------------------------------------------------------------
+            print("\n→ [1/3] Envoi de SHUTDOWN (0x0006)...")
+            self.write_controlword(self.CMD_SHUTDOWN)
+            
+            # Attend READY_TO_SWITCH_ON (bits = 0x0021 avec masque 0x006F)
+            if not self.wait_for_state(0x0021, 0x006F, timeout=2.0):
+                raise Exception("Timeout: READY_TO_SWITCH_ON non atteint")
+            
+            statusword = self.read_statusword()
+            print(f"✓ État atteint: {self.get_state_name(statusword)} (0x{statusword:04X})")
+            
+            # ----------------------------------------------------------------
+            # TRANSITION 2: SWITCH ON (vers SWITCHED_ON)
+            # ----------------------------------------------------------------
+            print("\n→ [2/3] Envoi de SWITCH_ON (0x0007)...")
+            self.write_controlword(self.CMD_SWITCH_ON)
+            
+            # Attend SWITCHED_ON (bits = 0x0023 avec masque 0x006F)
+            if not self.wait_for_state(0x0023, 0x006F, timeout=2.0):
+                raise Exception("Timeout: SWITCHED_ON non atteint")
+            
+            statusword = self.read_statusword()
+            print(f"✓ État atteint: {self.get_state_name(statusword)} (0x{statusword:04X})")
+            
+            # ----------------------------------------------------------------
+            # TRANSITION 3: ENABLE OPERATION (vers OPERATION_ENABLED)
+            # ----------------------------------------------------------------
+            print("\n→ [3/3] Envoi de ENABLE_OPERATION (0x000F)...")
+            self.write_controlword(self.CMD_ENABLE_OPERATION)
+            
+            # Attend OPERATION_ENABLED (bits = 0x0027 avec masque 0x006F)
+            if not self.wait_for_state(0x0027, 0x006F, timeout=2.0):
+                raise Exception("Timeout: OPERATION_ENABLED non atteint")
+            
+            statusword = self.read_statusword()
+            print(f"✓ État atteint: {self.get_state_name(statusword)} (0x{statusword:04X})")
+            
+            print("\n" + "✓" * 35)
+            print("✓ DRIVER ACTIVÉ - LE MOTEUR PEUT MAINTENANT BOUGER!")
+            print("✓" * 35 + "\n")
+            
+            return True
+            
+        except Exception as e:
+            print(f"\n✗ ERREUR lors de l'activation: {e}")
+            return False
+    
+    def set_velocity_mode(self):
+        """
+        Configure le driver en mode Profile Velocity (Mode 3)
+        
+        Le mode Profile Velocity est le plus simple pour débuter:
+        - On spécifie une vitesse cible
+        - On spécifie l'accélération/décélération
+        - Le driver gère la rampe automatiquement
+        
+        Référence: Section 3.4, pages 21-22 du manuel
+        
+        Returns:
+            True si succès, False sinon
+        """
+        print("=" * 70)
+        print("ÉTAPE 3: CONFIGURATION DU MODE VELOCITY")
+        print("=" * 70)
+        
+        try:
+            # Écrit le mode souhaité dans 0x6060
+            print("→ Sélection du mode PROFILE_VELOCITY (3)...")
+            if not self.write_sdo(self.OBJ_MODE_OF_OPERATION, 0, self.MODE_PROFILE_VELOCITY, 1):
+                raise Exception("Impossible d'écrire le mode")
+            
+            # Attend un peu que le driver prenne en compte
+            time.sleep(0.1)
+            
+            # Vérifie que le mode est bien actif via 0x6061
+            actual_mode = self.read_sdo(self.OBJ_MODE_OF_OPERATION_DISPLAY, 0, 1)
+            
+            if actual_mode != self.MODE_PROFILE_VELOCITY:
+                raise Exception(f"Mode incorrect: attendu 3, reçu {actual_mode}")
+            
+            print(f"✓ Mode actif: PROFILE_VELOCITY (code {actual_mode})")
+            print("✓ Configuration du mode terminée\n")
+            
+            return True
+            
+        except Exception as e:
+            print(f"✗ ERREUR lors de la configuration du mode: {e}")
+            return False
+    
+    def set_velocity_parameters(self, acceleration=50000, deceleration=50000):
+        """
+        Configure les paramètres d'accélération et décélération
+        
+        Ces valeurs contrôlent la douceur des rampes de vitesse.
+        
+        UNITÉS (selon le manuel):
+        - Accélération: units/s² (dépend de la résolution moteur)
+        - Décélération: units/s² (dépend de la résolution moteur)
+        
+        Valeurs typiques: 50000 units/s² (valeur du manuel, page 22)
+        
+        Args:
+            acceleration: Accélération en units/s²
+            deceleration: Décélération en units/s²
+        
+        Returns:
+            True si succès, False sinon
+        """
+        print("=" * 70)
+        print("ÉTAPE 4: CONFIGURATION DES PARAMÈTRES DE VITESSE")
+        print("=" * 70)
+        
+        try:
+            # Configure l'accélération (0x6083)
+            print(f"→ Configuration de l'accélération: {acceleration} units/s²...")
+            if not self.write_sdo(self.OBJ_PROFILE_ACCELERATION, 0, acceleration, 4):
+                raise Exception("Impossible d'écrire l'accélération")
+            print("✓ Accélération configurée")
+            
+            # Configure la décélération (0x6084)
+            print(f"→ Configuration de la décélération: {deceleration} units/s²...")
+            if not self.write_sdo(self.OBJ_PROFILE_DECELERATION, 0, deceleration, 4):
+                raise Exception("Impossible d'écrire la décélération")
+            print("✓ Décélération configurée")
+            
+            print("✓ Paramètres de vitesse configurés\n")
+            return True
+            
+        except Exception as e:
+            print(f"✗ ERREUR lors de la configuration des paramètres: {e}")
+            return False
+    
+    def set_velocity(self, velocity):
+        """
+        Définit la vitesse cible du moteur
+        
+        UNITÉS (selon le manuel):
+        - Vitesse: units/s (dépend de la résolution moteur)
+        - Une valeur positive = rotation dans un sens
+        - Une valeur négative = rotation dans l'autre sens
+        - 0 = arrêt du moteur
+        
+        Exemple de valeurs (manuel page 22):
+        - 20000 units/s = vitesse modérée
+        - 30000 units/s = vitesse élevée
+        
+        Args:
+            velocity: Vitesse cible en units/s (peut être négative)
+        
+        Returns:
+            True si succès, False sinon
+        """
+        try:
+            # La vitesse cible est un INT32 signé (0x60FF)
+            # On doit gérer les valeurs négatives correctement
+            if velocity < 0:
+                # Conversion en représentation complément à 2 pour 32 bits
+                velocity_unsigned = (1 << 32) + velocity
+            else:
+                velocity_unsigned = velocity
+            
+            print(f"→ Définition de la vitesse cible: {velocity} units/s...")
+            if not self.write_sdo(self.OBJ_TARGET_VELOCITY, 0, velocity_unsigned, 4):
+                raise Exception("Impossible d'écrire la vitesse")
+            
+            print("✓ Vitesse cible définie")
+            return True
+            
+        except Exception as e:
+            print(f"✗ ERREUR lors de la définition de la vitesse: {e}")
+            return False
+    
+    def start_motion(self):
+        """
+        Démarre le mouvement en mode velocity
+        
+        En mode Profile Velocity, le mouvement démarre en envoyant
+        le controlword avec le bit Halt=0 (bit 8).
+        
+        Référence: Section 3.4.3, page 22 du manuel
+        
+        Returns:
+            True si succès, False sinon
+        """
+        print("→ Démarrage du mouvement...")
+        
+        # En mode velocity, on utilise 0x000F (ENABLE_OPERATION) pour démarrer
+        # Le bit 8 (Halt) doit être à 0 pour autoriser le mouvement
+        if not self.write_controlword(self.CMD_ENABLE_OPERATION):
+            print("✗ Impossible de démarrer le mouvement")
+            return False
+        
+        print("✓ Mouvement démarré!")
+        return True
+    
+    def stop_motion(self):
+        """
+        Arrête le mouvement en utilisant le bit Halt
+        
+        Le moteur décélère selon le paramètre de décélération configuré.
+        
+        Returns:
+            True si succès, False sinon
+        """
+        print("→ Arrêt du mouvement (décélération)...")
+        
+        # Pour arrêter, on met le bit 8 (Halt) à 1
+        # 0x010F = 0b0000_0001_0000_1111 (bit 8 = 1, autres bits conservés)
+        if not self.write_controlword(0x010F):
+            print("✗ Impossible d'arrêter le mouvement")
+            return False
+        
+        print("✓ Arrêt en cours (décélération)...")
+        
+        # Attend que la vitesse soit nulle (bit 12 du statusword)
+        start_time = time.time()
+        while (time.time() - start_time) < 5.0:
+            statusword = self.read_statusword()
+            if statusword and (statusword & 0x1000):  # Bit 12 = Speed is 0
+                print("✓ Moteur arrêté")
+                return True
+            time.sleep(0.05)
+        
+        print("⚠ Timeout lors de l'arrêt (moteur peut encore bouger)")
+        return True
+    
+    def disable_drive(self):
+        """
+        Désactive le driver (coupe la puissance)
+        
+        Returns:
+            True si succès, False sinon
+        """
+        print("\n→ Désactivation du driver...")
+        
+        # Envoie la commande DISABLE_VOLTAGE
+        if not self.write_controlword(self.CMD_DISABLE_VOLTAGE):
+            print("✗ Impossible de désactiver le driver")
+            return False
+        
+        time.sleep(0.2)
+        
+        statusword = self.read_statusword()
+        print(f"✓ Driver désactivé - État: {self.get_state_name(statusword)}")
+        
+        return True
+    
+    def disconnect(self):
+        """
+        Ferme proprement la connexion EtherCAT
+        """
+        print("\n→ Fermeture de la connexion EtherCAT...")
+        
+        if self.master:
+            # Retour à l'état INIT (désactive tout)
+            self.master.state = pysoem.INIT_STATE
+            self.master.write_state()
+            
+            # Ferme la connexion
+            self.master.close()
+            
+            print("✓ Connexion fermée")
+
+
+def main():
+    """
+    Fonction principale - Exemple d'utilisation complète
+    """
+    print("\n")
+    print("=" * 70)
+    print(" CONTRÔLE DU DRIVER STF06-ETX VIA EtherCAT")
+    print(" Basé sur le manuel 920-0158 Rev:B")
+    print("=" * 70)
+    print()
+    
+    # ========================================================================
+    # CONFIGURATION
+    # Modifie ces valeurs selon ton installation
+    # ========================================================================
+    
+    INTERFACE = 'eth0'  # ← CHANGE CECI selon ton interface réseau
+    SLAVE_POSITION = 0  # Position du driver sur le réseau (0 = premier)
+    
+    # Paramètres de mouvement
+    VELOCITY = 20000      # Vitesse cible en units/s (valeur du manuel)
+    ACCELERATION = 50000  # Accélération en units/s² (valeur du manuel)
+    DECELERATION = 50000  # Décélération en units/s²
+    DURATION = 2.0        # Durée du mouvement en secondes
+    
+    # ========================================================================
+    # SÉQUENCE COMPLÈTE
+    # ========================================================================
+    
+    driver = STF06Driver(INTERFACE, SLAVE_POSITION)
+    
+    try:
+        # ÉTAPE 1: Connexion EtherCAT
+        if not driver.connect():
+            print("\n✗ ÉCHEC de la connexion")
+            return
+        
+        # ÉTAPE 2: Activation du driver (séquence FSA)
+        if not driver.enable_drive():
+            print("\n✗ ÉCHEC de l'activation")
+            return
+        
+        # ÉTAPE 3: Configuration du mode velocity
+        if not driver.set_velocity_mode():
+            print("\n✗ ÉCHEC de la configuration du mode")
+            return
+        
+        # ÉTAPE 4: Configuration des paramètres
+        if not driver.set_velocity_parameters(ACCELERATION, DECELERATION):
+            print("\n✗ ÉCHEC de la configuration des paramètres")
+            return
+        
+        # ====================================================================
+        # ÉTAPE 5: MOUVEMENT!
+        # ====================================================================
+        print("=" * 70)
+        print("ÉTAPE 5: MOUVEMENT DU MOTEUR")
+        print("=" * 70)
+        
+        # Définit la vitesse
+        if not driver.set_velocity(VELOCITY):
+            print("\n✗ ÉCHEC de la définition de vitesse")
+            return
+        
+        # Démarre le mouvement
+        if not driver.start_motion():
+            print("\n✗ ÉCHEC du démarrage")
+            return
+        
+        print(f"\n🔄 Moteur en rotation à {VELOCITY} units/s pendant {DURATION}s...")
+        print("   (Appuie sur Ctrl+C pour arrêter plus tôt)")
+        
+        # Attend la durée spécifiée
+        try:
+            time.sleep(DURATION)
+        except KeyboardInterrupt:
+            print("\n⚠ Interruption utilisateur")
+        
+        # Arrête le mouvement
+        driver.stop_motion()
+        
+        print("\n" + "=" * 70)
+        print("✓ SUCCÈS - SÉQUENCE COMPLÈTE TERMINÉE!")
+        print("=" * 70)
+        
+    except KeyboardInterrupt:
+        print("\n\n⚠ Interruption utilisateur (Ctrl+C)")
+    
+    except Exception as e:
+        print(f"\n\n✗ ERREUR FATALE: {e}")
+    
+    finally:
+        # Désactive et déconnecte proprement
+        try:
+            driver.disable_drive()
+            driver.disconnect()
+        except:
+            pass
+        
+        print("\nProgramme terminé.\n")
+
+
+if __name__ == "__main__":
+    # Vérifie que le script est exécuté en root (nécessaire pour EtherCAT)
+    import os
+    if os.geteuid() != 0:
+        print("\n⚠ ATTENTION: Ce script doit être exécuté en root!")
+        print("   Utilise: sudo python3 stf06_ethercat_control.py\n")
+        sys.exit(1)
+    
+    main()
