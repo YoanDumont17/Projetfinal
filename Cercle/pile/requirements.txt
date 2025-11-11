@@ -1,0 +1,9 @@
+# Requirements pour le detecteur de fibre optique
+# Installation: pip install -r requirements.txt
+
+# Traitement d'images
+opencv-python>=4.5.0
+numpy>=1.19.0
+
+# Optionnel: Pour des performances ameliorees
+# opencv-contrib-python>=4.5.0
