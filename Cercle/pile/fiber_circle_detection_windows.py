@@ -77,7 +77,7 @@ class FiberCircleDetector:
            
             # Nouveau: Exclure les cercles en dehors de la plage de diamètre 510-550 pixels (ajusté pour scale)
             original_diameter = 2 * (r / scale_factor)
-            if original_diameter < 510 or original_diameter > 550:
+            if original_diameter < 510 or original_diameter > 540:
                 print(f"Debug: Candidate discarded - original diameter {original_diameter:.2f} outside 510-550")
                 continue
            
@@ -90,7 +90,7 @@ class FiberCircleDetector:
             radius_score = max(0, 1 - radius_diff) * 2.0
             score += radius_score
            
-            margin = r * 0.3
+            margin = r * 0.5
             if x - r >= -margin and x + r <= width + margin and \
                y - r >= -margin and y + r <= height + margin:
                 completeness_score = 1.0
@@ -114,8 +114,8 @@ class FiberCircleDetector:
             homogeneity_score = max(0, 1 - homogeneity * 6.0) # Plus strict (*6 au lieu de 5)
             score += homogeneity_score * 5.0 # Poids augmenté
            
-            if homogeneity > 0.1: # Seuil baissé pour plus de strictness
-                print(f"Debug: Candidate discarded - homogeneity {homogeneity:.4f} > 0.1")
+            if homogeneity > 0.15: # Seuil baissé pour plus de strictness
+                print(f"Debug: Candidate discarded - homogeneity {homogeneity:.4f} > 0.15")
                 continue
            
             # Nouveau: Score de circularité (fit ellipse)
@@ -129,7 +129,7 @@ class FiberCircleDetector:
                 circularity = min(major, minor) / max(major, minor)
                 circularity_score = circularity * 2.0 # Poids pour favoriser rondeur
                 score += circularity_score
-                if circularity < 0.8: # Discard si pas assez rond
+                if circularity < 0.7: # Discard si pas assez rond
                     print(f"Debug: Candidate discarded - circularity {circularity:.4f} < 0.8")
                     continue
            
@@ -149,7 +149,7 @@ class FiberCircleDetector:
         bottom_overflow = max(0, (y + r) - height) / r
        
         visible = 1.0 - (left_overflow + right_overflow + top_overflow + bottom_overflow) / 4
-        return max(0.3, visible)
+        return max(0.2, visible)
    
     def detect_multi_strategy(self, img: np.ndarray) -> Optional[np.ndarray]:
         orig_shape = img.shape[:2]
@@ -363,7 +363,7 @@ def process_image(input_path: str, output_path: Optional[str] = None,
         return False
 
 if __name__ == "__main__":
-    image_dir = "Cercle\files2"  # Remplace par le chemin du dossier contenant les images si nécessaire, ex. "chemin/vers/images"
+    image_dir = "Cercle\pile"  # Remplace par le chemin du dossier contenant les images si nécessaire, ex. "chemin/vers/images"
     for i in range(1, 25):
         input_path = os.path.join(image_dir, f"{i}.png")
         if os.path.exists(input_path):
