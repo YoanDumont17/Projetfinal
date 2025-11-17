@@ -85,10 +85,10 @@ def process_stack(input_dir, cropped_dir="cropped_images", padding=50, show=Fals
 
 if __name__ == "__main__":
     # Dossier d'entrée avec les images originales
-    input_dir = r"Cercle\image_fibre_2"  # Remplace par ton dossier réel
+    input_dir = r"Cercle\image_fibre_1"  # Remplace par ton dossier réel
     
     # Choisis manuellement le padding ici (ex: 0 pour cercle exact, 5 pour +5px, -10 pour rétréci de 10px)
-    manual_padding = 6  # Modifie cette valeur pour tester
+    manual_padding = 0 # Modifie cette valeur pour tester
     
     # Traiter la pile et générer les crops masqués
     cropped_dir = process_stack(input_dir, padding=manual_padding)
