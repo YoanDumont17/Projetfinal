@@ -385,7 +385,7 @@ def process_image(input_path: str, output_dir: str = "detected_images", expected
 
 if __name__ == "__main__":
     image_dir = "Cercle\\pile"  # Remplace par le chemin du dossier contenant les images si nécessaire, ex. "chemin/vers/images"
-    for i in range(1, 25):
+    for i in range(1, 22):
         input_path = os.path.join(image_dir, f"{i}.png")
         if os.path.exists(input_path):
             print(f"Traitement de {input_path}...")

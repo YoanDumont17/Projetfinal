@@ -9,7 +9,7 @@ import os
 import cv2
 import numpy as np
 from detection_fibre import FiberCircleDetector  # Import de la classe de détection de fibre
-from depth_focus import AnalyseurNettete  # Import de la classe d'analyse de netteté
+from depth_focus2 import AnalyseurNettete  # Import de la classe d'analyse de netteté
 
 def crop_around_fiber(img, circle, padding=50):
     """

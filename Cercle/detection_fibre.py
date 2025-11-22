@@ -115,7 +115,7 @@ class FiberCircleDetector:
             homogeneity_score = max(0, 1 - homogeneity * 6.0)
             score += homogeneity_score * 5.0
 
-            if homogeneity > 0.15:
+            if homogeneity > 0.10:
                 print(f"Debug: Candidate discarded - homogeneity {homogeneity:.4f} > 0.15")
                 continue
 
@@ -149,7 +149,7 @@ class FiberCircleDetector:
         bottom_overflow = max(0, (y + r) - height) / r
 
         visible = 1.0 - (left_overflow + right_overflow + top_overflow + bottom_overflow) / 4
-        return max(0.2, visible)
+        return max(0.05, visible)
 
     def detect_multi_strategy(self, img: np.ndarray) -> Optional[np.ndarray]:
         orig_shape = img.shape[:2]
@@ -174,7 +174,7 @@ class FiberCircleDetector:
             print("Debug: Image considered blurry - relaxing parameters")
             self.radius_tolerance = 0.7  # Augmente tolérance pour flou
             diameter_min = 350
-            diameter_max = 600
+            diameter_max = 750
             hough_param2_base = 15  # Plus bas pour gradients faibles
             blob_min_circ = 0.6
             blob_min_conv = 0.7
@@ -347,4 +347,49 @@ class FiberCircleDetector:
 
         return output
 
-# Plus de bloc main ici pour éviter exécution automatique lors de l'import
+def process_image(input_path: str, output_dir: str = "detected_images", expected_radius: Optional[int] = None, show: bool = True) -> bool:
+    radius = expected_radius if expected_radius is not None else 0
+    detector = FiberCircleDetector(expected_radius=radius, radius_tolerance=0.6)
+
+    # Créer le dossier s'il n'existe pas
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    try:
+        circle, img = detector.detect(input_path)
+
+        base_name = os.path.basename(input_path)
+        output_path = os.path.join(output_dir, f"{base_name}_detected.png")
+
+        result = detector.draw_result(img, circle, output_path)
+
+        if circle is not None:
+            print(f"[OK] Cercle detecte dans {input_path}")
+            print(f" Position: ({int(circle[0])}, {int(circle[1])})")
+            print(f" Rayon: {int(circle[2])} pixels")
+        else:
+            print(f"[ECHEC] Aucun cercle detecte dans {input_path}")
+
+        if show:
+            cv2.imshow('Detection de fibre optique', result)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+
+        print(f"-> Resultat sauvegarde: {output_path}")
+
+        return circle is not None
+
+    except Exception as e:
+        print(f"Erreur lors du traitement de {input_path}: {e}")
+        return False
+
+if __name__ == "__main__":
+    image_dir = "Cercle\\pile"  # Remplace par le chemin du dossier contenant les images si nécessaire, ex. "chemin/vers/images"
+    for i in range(1, 22):
+        input_path = os.path.join(image_dir, f"{i}.png")
+        if os.path.exists(input_path):
+            print(f"Traitement de {input_path}...")
+            process_image(input_path, show=True)  # Affiche et attend une touche pour continuer
+        else:
+            print(f"Fichier {input_path} non trouvé, saut.")
+    print("Traitement terminé pour toutes les images.")
